@@ -1,30 +1,36 @@
-using System.CommandLine;
 using DecompilerMCPServer;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
-Option<FileInfo> dllOption = new("--dll", "-d")
+var builder = Host.CreateApplicationBuilder(args);
+
+// Fail fast on missing/invalid ScanDirectory, before starting the transport
+var scanDirectory = builder.Configuration["ScanDirectory"];
+if (string.IsNullOrWhiteSpace(scanDirectory))
 {
-    Description = "Path to the .NET DLL to decompile",
-    Required = true,
-};
-dllOption.AcceptExistingOnly();
-
-RootCommand rootCommand = new("Decompiles a .NET assembly to C# source code");
-rootCommand.Options.Add(dllOption);
-
-rootCommand.SetAction(parseResult =>
+    Console.Error.WriteLine("Error: ScanDirectory is not configured. " +
+        "Pass --ScanDirectory /path/to/dlls or set the ScanDirectory environment variable.");
+    return 1;
+}
+scanDirectory = Path.GetFullPath(scanDirectory);
+if (!Directory.Exists(scanDirectory))
 {
-    FileInfo dll = parseResult.GetValue(dllOption)!;
-    try
-    {
-        var service = new DecompilerService();
-        Console.WriteLine(service.DecompileAssembly(dll.FullName));
-        return 0;
-    }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"Error: could not decompile '{dll.FullName}': {ex.Message}");
-        return 1;
-    }
-});
+    Console.Error.WriteLine($"Error: ScanDirectory '{scanDirectory}' does not exist or is not a directory.");
+    return 1;
+}
 
-return rootCommand.Parse(args).Invoke();
+// stdout carries JSON-RPC; all logging goes to stderr
+builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
+
+builder.Services.AddSingleton(new ScanOptions(scanDirectory));
+builder.Services.AddSingleton<DecompilerService>();
+builder.Services.AddSingleton<AssemblyDiscoveryService>();
+builder.Services.AddSingleton<DecompilationCache>();
+
+builder.Services.AddMcpServer()
+    .WithStdioServerTransport()
+    .WithTools<DecompilerTools>();
+
+await builder.Build().RunAsync();
+return 0;
