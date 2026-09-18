@@ -2,6 +2,9 @@ namespace DecompilerMCPServer;
 
 public sealed record ScanOptions(string ScanDirectory);
 
+/// <summary>Root under which decompiled projects are written, mirroring the scan directory's layout.</summary>
+public sealed record ExportOptions(string OutputDirectory);
+
 public sealed class AssemblyDiscoveryService(ScanOptions options)
 {
     private static readonly EnumerationOptions Enumeration = new()
@@ -13,6 +16,9 @@ public sealed class AssemblyDiscoveryService(ScanOptions options)
 
     public string Root => options.ScanDirectory;
 
+    /// <summary>Full path of a scan-relative path as returned by FindAssemblies.</summary>
+    public string FullPath(string relativePath) => Path.Combine(Root, relativePath);
+
     /// <summary>Relative paths of all *.dll files under the scan directory, sorted. Fresh scan per call.</summary>
     public IReadOnlyList<string> FindAssemblies() =>
         Directory.EnumerateFiles(Root, "*.dll", Enumeration)
@@ -22,10 +28,11 @@ public sealed class AssemblyDiscoveryService(ScanOptions options)
 
     /// <summary>
     /// Resolves an assembly identifier (relative path from FindAssemblies, or a simple name
-    /// like "MyLib" / "MyLib.dll") to a full path. Never picks silently among duplicates.
+    /// like "MyLib" / "MyLib.dll") to its relative and full paths. Never picks silently among duplicates.
     /// </summary>
-    public bool TryResolve(string identifier, out string fullPath, out string error)
+    public bool TryResolve(string identifier, out string relativePath, out string fullPath, out string error)
     {
+        relativePath = string.Empty;
         fullPath = string.Empty;
         error = string.Empty;
 
@@ -59,7 +66,8 @@ public sealed class AssemblyDiscoveryService(ScanOptions options)
 
         // candidates come from FindAssemblies (relative paths enumerated under Root),
         // so the combined path cannot escape the scan directory
-        fullPath = Path.GetFullPath(Path.Combine(Root, candidates[0]));
+        relativePath = candidates[0];
+        fullPath = Path.GetFullPath(FullPath(relativePath));
         return true;
     }
 }

@@ -1,6 +1,6 @@
 # DecompilerMCPServer
 
-An MCP (Model Context Protocol) server that decompiles .NET assemblies to C# source code. Point it at a folder, and it recursively finds every DLL in it, letting an MCP client (such as Claude Code or Claude Desktop) list assemblies, decompile whole assemblies or individual types, and regex-search across all of the decompiled code.
+An MCP (Model Context Protocol) server that decompiles .NET assemblies to C# source code on disk. Point it at a folder, and it recursively finds every DLL in it, exports each one as an ILSpy project (one `.cs` file per type, grouped by namespace) into an output tree that mirrors the DLL folder layout, and lets an MCP client (such as Claude Code or Claude Desktop) list assemblies, locate the file for an assembly or a type, and regex-search across all of the decompiled code. Tool responses carry file paths and summaries, not source text, so the client reads only the files it needs.
 
 Built on [ICSharpCode.Decompiler](https://github.com/icsharpcode/ILSpy) (the ILSpy engine) and the official [MCP C# SDK](https://github.com/modelcontextprotocol/csharp-sdk), communicating over stdio.
 
@@ -62,6 +62,33 @@ ScanDirectory=/path/to/dlls DecompilerMCPServer
 ```
 
 If the setting is missing or the directory doesn't exist, the server prints an error to stderr and exits with code 1 instead of starting.
+
+One setting is optional: **`OutputDirectory`** — where decompiled projects are written. Same two forms (`--OutputDirectory /path` or the `OutputDirectory` environment variable). When omitted it defaults to a per-user folder derived from the scan directory:
+
+| Platform | Default |
+|---|---|
+| macOS | `~/Library/Application Support/DecompilerMCPServer/sources/<folder>-<hash>/` |
+| Windows | `%LOCALAPPDATA%\DecompilerMCPServer\sources\<folder>-<hash>\` |
+
+`<folder>` is the scan directory's last path segment and `<hash>` the first 8 hex digits of a SHA-256 of its full path, so two scan folders with the same name don't collide. `list_assemblies` prints the resolved location.
+
+Inside the output directory, each DLL gets a project folder at its scan-relative path, **keeping the `.dll` suffix** so project folders never collide with namespace folders:
+
+```
+<OutputDirectory>/
+  lib/Foo/Bar.dll/            <- from <ScanDirectory>/lib/Foo/Bar.dll
+    Bar.csproj
+    .decompiled.json          <- manifest used to detect a changed DLL
+    Properties/AssemblyInfo.cs
+    My.Namespace/Widget.cs    <- one file per top-level type; nested types live in their outer type's file
+    My.Namespace.Sub/Other.cs
+```
+
+Rules:
+
+- The server owns the output directory: it deletes and rewrites project folders whenever a DLL changes. Don't keep anything else there. To reset everything, delete the directory.
+- The scan and output directories must not be the same or nested inside each other (the export writes embedded resources out as files, which can include DLLs). The server refuses to start otherwise.
+- On Windows, deep namespace paths under the default location can approach the 260-character path limit; pass a short `--OutputDirectory` (or enable long paths) if exports fail with path errors.
 
 ## Registering with an MCP client
 
@@ -174,26 +201,32 @@ Lists every DLL found recursively under the scan directory. The returned relativ
 
 ### `decompile_assembly`
 
-Decompiles an entire assembly to C#.
+Exports an entire assembly to disk as an ILSpy project and returns the project folder path, the `.csproj` path, file and error counts, the namespace folders (at most 50 listed, then `+N more`), and whether an existing export was reused.
 
 | Parameter | Description |
 |---|---|
 | `assembly` | Relative path from `list_assemblies`, or a simple name like `MyLib` / `MyLib.dll` |
 
-Output is capped at 200,000 characters; for large assemblies prefer `decompile_type` or `search_code`. If a simple name matches more than one DLL (common in build trees), the tool returns the candidate paths and asks for the relative path.
+If a simple name matches more than one DLL (common in build trees), the tool returns the candidate paths and asks for the relative path.
 
 ### `decompile_type`
 
-Decompiles a single type — the context-friendly way to read code.
+Returns the path of the file holding a single type, exporting its assembly first if needed — the context-friendly way to read code.
 
 | Parameter | Description |
 |---|---|
-| `typeName` | Full type name, e.g. `MyNamespace.MyClass`. Nested types use `+` (`Outer+Inner`); generic types include arity (``Widget`1``) |
-| `assembly` | Optional. If omitted, all scanned assemblies are probed (fast metadata check) and the owning assembly is reported in a `// From:` header |
+| `typeName` | Full type name, e.g. `MyNamespace.MyClass`. Nested types use `+` (`Outer+Inner`) and resolve to the outer type's file; generic types include arity (``Widget`1``) and share a file with same-named non-generic types |
+| `assembly` | Optional. If omitted, all scanned assemblies are probed (fast metadata check) and the owning assembly is reported |
+
+Compiler-generated and hidden types (`<Module>`, `<PrivateImplementationDetails>`, embedded attribute shims) are not exported and return an error pointing at the project folder.
+
+### `decompile_all`
+
+Exports every scanned assembly (skipping ones already exported and unchanged) and returns totals plus a list of any DLLs that failed. Takes no parameters. Sends MCP progress notifications per assembly for clients that supply a progress token; on a large folder this can run for minutes.
 
 ### `search_code`
 
-Regex search across the decompiled source of all scanned assemblies. Results are grouped by assembly with 1-based line numbers that align with `decompile_assembly` output for the same DLL.
+Regex search across the decompiled source of all scanned assemblies, exporting any assembly not yet on disk first. Results are grouped by source file (absolute path) with 1-based line numbers into that file.
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -205,8 +238,9 @@ Regex search across the decompiled source of all scanned assemblies. Results are
 
 ## Behavior notes
 
-- **Caching**: each DLL is decompiled at most once per server session and cached in memory, keyed by file path and last-write time — rebuilding a DLL refreshes it automatically. The first `search_code` across a large folder pays the full decompilation cost (a ~3 MB assembly takes tens of seconds); subsequent calls are instant.
-- **Resilience**: a corrupt or unreadable DLL is skipped with a note in search results and reported as an error text elsewhere; bad input (invalid regex, unknown type) returns a descriptive `Error: ...` message. The server itself keeps running.
+- **Exports persist**: each project folder carries a `.decompiled.json` manifest recording the DLL's size, timestamp, module version id (MVID) and the ILSpy engine version. While all four match, every tool reuses the export — across server restarts too. Rebuilding a DLL (or upgrading the server's decompiler) triggers a fresh export into a temp folder that is swapped into place, so a crash never leaves a half-written project. The first `search_code` or `decompile_all` across a large folder pays the full export cost (a ~3 MB assembly takes tens of seconds); subsequent calls are instant.
+- **Shared output**: several server processes (say, Claude Code and Claude Desktop registered on the same folder) can share an output directory; a lock file beside each project folder makes them take turns, so a DLL is exported once.
+- **Resilience**: a corrupt or unreadable DLL is skipped with a note in search results, listed under "Failed assemblies" by `decompile_all`, and reported as an error text elsewhere; bad input (invalid regex, unknown type) returns a descriptive `Error: ...` message. The server itself keeps running.
 - **Regex safety**: patterns run with a 2-second match timeout; a timeout returns partial results with a warning.
 - **Logging**: all logs go to stderr; stdout carries only JSON-RPC.
 
@@ -215,10 +249,10 @@ Regex search across the decompiled source of all scanned assemblies. Results are
 | File | Responsibility |
 |---|---|
 | `Program.cs` | Host bootstrap, config validation, DI, MCP registration |
-| `DecompilerTools.cs` | The four MCP tools and their error handling |
-| `DecompilerService.cs` | Pure decompilation (whole module, single type, type probe) |
+| `DecompilerTools.cs` | The five MCP tools and their error handling |
+| `DecompilerService.cs` | ILSpy wrapper: whole-project export, type-to-file mapping, metadata probes |
 | `AssemblyDiscoveryService.cs` | Recursive scan and identifier resolution |
-| `DecompilationCache.cs` | Path + timestamp keyed cache of decompiled source |
+| `ProjectExportCache.cs` | Manifest-backed export cache: freshness check, cross-process lock, temp-and-swap writes |
 
 ## Releasing (maintainers)
 
