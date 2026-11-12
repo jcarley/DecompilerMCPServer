@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using DecompilerMCPServer;
+using DecompilerMCPServer.LanguageServer;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -46,6 +47,55 @@ catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or A
     return 1;
 }
 
+// WatchScanDirectory (default true): export everything in the background at startup and keep exports in sync
+var watchSetting = builder.Configuration["WatchScanDirectory"];
+bool watchScanDirectory = true;
+if (!string.IsNullOrWhiteSpace(watchSetting) && !bool.TryParse(watchSetting, out watchScanDirectory))
+{
+    Console.Error.WriteLine($"Error: WatchScanDirectory must be 'true' or 'false', got '{watchSetting}'.");
+    return 1;
+}
+
+// EnableLanguageServer (default false): semantic tools backed by a Roslyn language server started on first use
+var languageServerSetting = builder.Configuration["EnableLanguageServer"];
+bool enableLanguageServer = false;
+if (!string.IsNullOrWhiteSpace(languageServerSetting) && !bool.TryParse(languageServerSetting, out enableLanguageServer))
+{
+    Console.Error.WriteLine($"Error: EnableLanguageServer must be 'true' or 'false', got '{languageServerSetting}'.");
+    return 1;
+}
+
+LanguageServerOptions? languageServerOptions = null;
+if (enableLanguageServer)
+{
+    var serverPath = NullIfBlank(builder.Configuration["LanguageServerPath"]);
+    if (serverPath is not null && !File.Exists(serverPath = Path.GetFullPath(serverPath)))
+    {
+        Console.Error.WriteLine($"Error: LanguageServerPath '{serverPath}' does not exist. " +
+            "It must point at Microsoft.CodeAnalysis.LanguageServer.dll.");
+        return 1;
+    }
+    var dotnetPath = NullIfBlank(builder.Configuration["DotnetPath"]);
+    if (dotnetPath is not null && !File.Exists(dotnetPath = Path.GetFullPath(dotnetPath)))
+    {
+        Console.Error.WriteLine($"Error: DotnetPath '{dotnetPath}' does not exist. It must point at the dotnet executable.");
+        return 1;
+    }
+    var timeoutSetting = NullIfBlank(builder.Configuration["LanguageServerLoadTimeoutSeconds"]);
+    int loadTimeoutSeconds = 300;
+    if (timeoutSetting is not null && (!int.TryParse(timeoutSetting, out loadTimeoutSeconds) || loadTimeoutSeconds < 1))
+    {
+        Console.Error.WriteLine($"Error: LanguageServerLoadTimeoutSeconds must be a positive integer, got '{timeoutSetting}'.");
+        return 1;
+    }
+    languageServerOptions = new LanguageServerOptions(
+        serverPath,
+        NullIfBlank(builder.Configuration["LanguageServerVersion"]),
+        dotnetPath,
+        LanguageServerOptions.DefaultInstallRoot,
+        TimeSpan.FromSeconds(loadTimeoutSeconds));
+}
+
 // stdout carries JSON-RPC; all logging goes to stderr
 builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
 
@@ -54,13 +104,30 @@ builder.Services.AddSingleton(new ExportOptions(outputDirectory));
 builder.Services.AddSingleton<DecompilerService>();
 builder.Services.AddSingleton<AssemblyDiscoveryService>();
 builder.Services.AddSingleton<ProjectExportCache>();
+if (watchScanDirectory)
+    builder.Services.AddHostedService<ScanDirectoryMonitor>();
 
-builder.Services.AddMcpServer()
+var mcp = builder.Services.AddMcpServer()
     .WithStdioServerTransport()
     .WithTools<DecompilerTools>();
 
+if (languageServerOptions is not null)
+{
+    builder.Services.AddSingleton(languageServerOptions);
+    builder.Services.AddSingleton<DotnetLocator>();
+    builder.Services.AddSingleton<RoslynServerLocator>();
+    builder.Services.AddSingleton<RoslynServerInstaller>();
+    builder.Services.AddSingleton<WorkspaceGenerator>();
+    builder.Services.AddSingleton<RoslynLanguageServerHost>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<RoslynLanguageServerHost>());
+    builder.Services.AddSingleton<SymbolResolver>();
+    mcp.WithTools<LanguageServerTools>();
+}
+
 await builder.Build().RunAsync();
 return 0;
+
+static string? NullIfBlank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
 
 static string Normalize(string path) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
 

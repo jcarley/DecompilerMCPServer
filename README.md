@@ -1,6 +1,8 @@
 # DecompilerMCPServer
 
-An MCP (Model Context Protocol) server that decompiles .NET assemblies to C# source code on disk. Point it at a folder, and it recursively finds every DLL in it, exports each one as an ILSpy project (one `.cs` file per type, grouped by namespace) into an output tree that mirrors the DLL folder layout, and lets an MCP client (such as Claude Code or Claude Desktop) list assemblies, locate the file for an assembly or a type, and regex-search across all of the decompiled code. Tool responses carry file paths and summaries, not source text, so the client reads only the files it needs.
+An MCP (Model Context Protocol) server that decompiles .NET assemblies to C# source code on disk. Point it at a folder, and it recursively finds every DLL in it, exports each one as an ILSpy project (one `.cs` file per type, grouped by namespace) into an output tree that mirrors the DLL folder layout, and lets an MCP client (such as Claude Code or Claude Desktop) list assemblies, locate the file for an assembly or a type, and regex-search across all of the decompiled code. Tool responses carry file paths and summaries (plus short line snippets for searches and navigation), not whole files, so the client reads only the files it needs.
+
+Optionally (`--EnableLanguageServer true`), it also runs a [Roslyn language server](#language-server-optional) over the decompiled sources and adds semantic navigation: find symbols, go to definition across assemblies, find references and implementations, outline a file, and show signatures.
 
 Built on [ICSharpCode.Decompiler](https://github.com/icsharpcode/ILSpy) (the ILSpy engine) and the official [MCP C# SDK](https://github.com/modelcontextprotocol/csharp-sdk), communicating over stdio.
 
@@ -72,6 +74,8 @@ One setting is optional: **`OutputDirectory`** — where decompiled projects are
 
 `<folder>` is the scan directory's last path segment and `<hash>` the first 8 hex digits of a SHA-256 of its full path, so two scan folders with the same name don't collide. `list_assemblies` prints the resolved location.
 
+Another optional setting: **`WatchScanDirectory`** (`true` by default; `--WatchScanDirectory false` or the `WatchScanDirectory` environment variable). When on, the server exports every DLL in the background as soon as it starts, then watches the scan directory and its subfolders: new or changed DLLs are re-exported a couple of seconds after they settle, and the export of a deleted or renamed DLL is removed. Set it to `false` to export only on demand, when a tool first needs a DLL.
+
 Inside the output directory, each DLL gets a project folder at its scan-relative path, **keeping the `.dll` suffix** so project folders never collide with namespace folders:
 
 ```
@@ -86,9 +90,46 @@ Inside the output directory, each DLL gets a project folder at its scan-relative
 
 Rules:
 
-- The server owns the output directory: it deletes and rewrites project folders whenever a DLL changes. Don't keep anything else there. To reset everything, delete the directory.
+- The server owns the output directory: it deletes and rewrites project folders whenever a DLL changes, and (with `WatchScanDirectory` on) deletes project folders whose DLL no longer exists in the scan directory. Don't keep anything else there, and don't share one custom `--OutputDirectory` between servers with different scan directories. To reset everything, delete the directory.
 - The scan and output directories must not be the same or nested inside each other (the export writes embedded resources out as files, which can include DLLs). The server refuses to start otherwise.
 - On Windows, deep namespace paths under the default location can approach the 260-character path limit; pass a short `--OutputDirectory` (or enable long paths) if exports fail with path errors.
+
+### Language server (optional)
+
+**`EnableLanguageServer`** (`false` by default; `--EnableLanguageServer true`) adds six tools backed by the official Roslyn language server (`Microsoft.CodeAnalysis.LanguageServer`, the engine behind the VS Code C# extension). Nothing starts until the first of those tools is called; that call exports every DLL in the scan directory, builds a solution over the exports, and waits for the language server to load it, so expect it to take from a few seconds to a few minutes depending on the folder. Later calls are fast, and the workspace reloads automatically when exports change.
+
+Prerequisites: a **.NET 10 SDK** on the machine (the release binaries are self-contained, but the language server is a .NET 10 app that loads projects through MSBuild). Get it from [dot.net/download](https://dot.net/download).
+
+The server reuses what is already installed before downloading anything:
+
+1. **dotnet**: `--DotnetPath`, then `DOTNET_ROOT`, then `PATH`, then the default install locations. It needs a .NET 10+ runtime and SDK.
+2. **Roslyn language server**, first compatible match:
+   1. `--LanguageServerPath`
+   2. a copy this server downloaded earlier (`%LOCALAPPDATA%\DecompilerMCPServer\roslyn-ls\` on Windows, `~/Library/Application Support/DecompilerMCPServer/roslyn-ls/` on macOS)
+   3. the copy bundled with the C# extension of VS Code, VS Code Insiders, VS Code Server, Cursor or Windsurf
+   4. a `roslyn-language-server` dotnet tool
+
+   A candidate counts as compatible when its runtime requirements are met by the dotnet found in step 1, and it really starts. If a candidate fails to start, the next one is tried.
+3. **Download**: if nothing usable is found, the pinned `roslyn-language-server.<platform>` package (version 5.11.0, about 70 MB) is downloaded once from nuget.org. It is checked against a SHA256 built into the server and cached in the folder above. The language server is MIT-licensed and isn't redistributed with this server.
+
+stderr logs which server was chosen (`Using Roslyn language server ... from ...`).
+
+| Setting | Default | Description |
+|---|---|---|
+| `EnableLanguageServer` | `false` | Register the language-server tools |
+| `LanguageServerPath` | discovered | Path to `Microsoft.CodeAnalysis.LanguageServer.dll`; skips discovery and download |
+| `LanguageServerVersion` | `5.11.0` | Use exactly this `roslyn-language-server` version (from the cache, downloading it if needed; versions other than the pinned one are not checksum-verified) and skip editor installs |
+| `DotnetPath` | discovered | The `dotnet` executable to run the language server with |
+| `LanguageServerLoadTimeoutSeconds` | `300` | How long a call waits for the workspace to load before answering with what is loaded |
+
+All of them accept the same `--Name value` / environment-variable forms as the other settings.
+
+Inside the output directory, the language server adds:
+- `DecompiledWorkspace.slnx`
+- `Directory.Build.props` and `Directory.Build.targets`. These redirect build output to `.lsp/`, and turn references between exported assemblies into project references, so "go to definition" crosses assemblies.
+- the `.lsp/` folder itself.
+
+ILSpy's project files are not modified. Types from assemblies outside the scan directory (the framework, missing dependencies) resolve to Roslyn's own metadata view and are reported as external. Expect diagnostics noise in decompiled code that references assemblies the folder doesn't contain; the tools don't surface diagnostics.
 
 ## Registering with an MCP client
 
@@ -236,9 +277,63 @@ Regex search across the decompiled source of all scanned assemblies, exporting a
 | `maxResults` | `100` | Total matching lines to return (max 500) |
 | `assembly` | all | Restrict the search to one assembly |
 
+### Language server tools
+
+Registered only with `--EnableLanguageServer true` (see [Language server](#language-server-optional)). Line and column numbers are 1-based. Results list absolute file paths with the matching line, like `search_code`.
+
+The navigation tools (`go_to_definition`, `find_references`, `find_implementations`, `hover`) identify the symbol in one of two ways.
+
+The first is **by name**, in `symbol`:
+- `Ns.Type`
+- `Type.Member`
+- ``Ns.Type`2.Method(int, string)``, which uses generic arity and a parameter list to pick an overload. `Widget<T>` works as well as ``Widget`1``.
+- `Ns.Type..ctor` for constructors.
+
+A partial name matches any declaration whose qualified name ends with it. If several match, the tool lists them and asks for a more specific name.
+
+The second is **by position**: `file` + `line` + `column`, or `file` + `line` + `symbol` to locate the name on that line. `file` is a decompiled `.cs` path under the output directory, absolute or relative to it.
+
+#### `find_symbol`
+
+Fuzzy search for declarations by name across all assemblies.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `query` | — | Name or partial name |
+| `kind` | any | `class`, `interface`, `struct`, `enum`, `type`, `method`, `property`, `field`, `constant`, `event`, `enummember`, `operator` or `namespace`. Constructors are reported as methods |
+| `assembly` | all | Restrict to one assembly |
+| `maxResults` | `50` | Max 200 |
+
+#### `get_document_symbols`
+
+Outline of one file: namespaces, types and members with signatures and line numbers (at most 2000 entries). Pass `file`, or `type` to outline the file declaring it.
+
+#### `go_to_definition`
+
+Where the symbol is declared, with `contextLines` (default 2, max 10) of surrounding source. Works across assemblies in the scan directory. Anything else is reported as `(external) [Assembly] <declaration>`.
+
+#### `find_references`
+
+All references, grouped by file.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `includeDeclaration` | `false` | Include the declaration itself |
+| `contextLines` | `0` | Max 10 |
+| `maxResults` | `100` | Max 500 |
+
+#### `find_implementations`
+
+Implementations of an interface or interface member, and overrides of abstract or virtual members. Takes `contextLines` (default 0) and `maxResults` (default 100, max 500).
+
+#### `hover`
+
+The symbol's full signature, including constraints, and its XML documentation when the assembly shipped any.
+
 ## Behavior notes
 
-- **Exports persist**: each project folder carries a `.decompiled.json` manifest recording the DLL's size, timestamp, module version id (MVID) and the ILSpy engine version. While all four match, every tool reuses the export — across server restarts too. Rebuilding a DLL (or upgrading the server's decompiler) triggers a fresh export into a temp folder that is swapped into place, so a crash never leaves a half-written project. The first `search_code` or `decompile_all` across a large folder pays the full export cost (a ~3 MB assembly takes tens of seconds); subsequent calls are instant.
+- **Exports persist**: each project folder carries a `.decompiled.json` manifest recording the DLL's size, timestamp, module version id (MVID) and the ILSpy engine version. While all four match, every tool reuses the export — across server restarts too. Rebuilding a DLL (or upgrading the server's decompiler) triggers a fresh export into a temp folder that is swapped into place, so a crash never leaves a half-written project. A large folder takes a while to export the first time (a ~3 MB assembly takes tens of seconds); with `WatchScanDirectory` on this happens in the background at startup, and a tool that needs a DLL still being exported waits for that export to finish. Subsequent calls are instant.
+- **Background sync** (`WatchScanDirectory`, on by default): exports run one at a time on a background thread so the server stays responsive. A DLL that is still locked or being written is retried with backoff; a missed or overflowing file-watcher event triggers a full rescan. Progress and failures are logged to stderr.
 - **Shared output**: several server processes (say, Claude Code and Claude Desktop registered on the same folder) can share an output directory; a lock file beside each project folder makes them take turns, so a DLL is exported once.
 - **Resilience**: a corrupt or unreadable DLL is skipped with a note in search results, listed under "Failed assemblies" by `decompile_all`, and reported as an error text elsewhere; bad input (invalid regex, unknown type) returns a descriptive `Error: ...` message. The server itself keeps running.
 - **Regex safety**: patterns run with a 2-second match timeout; a timeout returns partial results with a warning.
@@ -249,10 +344,14 @@ Regex search across the decompiled source of all scanned assemblies, exporting a
 | File | Responsibility |
 |---|---|
 | `Program.cs` | Host bootstrap, config validation, DI, MCP registration |
-| `DecompilerTools.cs` | The five MCP tools and their error handling |
+| `DecompilerTools.cs` | The five core MCP tools and their error handling |
 | `DecompilerService.cs` | ILSpy wrapper: whole-project export, type-to-file mapping, metadata probes |
 | `AssemblyDiscoveryService.cs` | Recursive scan and identifier resolution |
 | `ProjectExportCache.cs` | Manifest-backed export cache: freshness check, cross-process lock, temp-and-swap writes |
+| `ScanDirectoryMonitor.cs` | Background startup export and file watching that keeps exports in sync with the scan directory |
+| `LanguageServerTools.cs` | The six optional language-server tools |
+| `LanguageServer/` | Roslyn language server hosting: dotnet/server discovery, download fallback, workspace generation, LSP client, symbol resolution |
+| `tests/DecompilerMCPServer.Tests/` | xUnit tests (`dotnet test tests/DecompilerMCPServer.Tests`) |
 
 ## Releasing (maintainers)
 

@@ -44,7 +44,16 @@ public sealed class ProjectExportCache(ExportOptions options, DecompilerService 
     // case-insensitive comparer would conflate distinct files on case-sensitive filesystems.
     private readonly ConcurrentDictionary<string, Entry> _cache = new(StringComparer.Ordinal);
 
+    /// <summary>Name of the folder at the output root holding generated language-server build state; never an export.</summary>
+    public const string LanguageServerFolderName = ".lsp";
+
     public string OutputDirectory => options.OutputDirectory;
+
+    /// <summary>
+    /// Raised with the output-relative path after an export was written or removed on disk (not when one is reused).
+    /// Handlers run synchronously on the exporting thread and must be quick.
+    /// </summary>
+    public event Action<string>? ExportsChanged;
 
     /// <summary>Where the given assembly's project is (or would be) written.</summary>
     public string ProjectDirectoryFor(string relativePath) => Path.Combine(options.OutputDirectory, relativePath);
@@ -56,12 +65,19 @@ public sealed class ProjectExportCache(ExportOptions options, DecompilerService 
         var stamp = new Stamp(info.LastWriteTimeUtc.Ticks, info.Length);
         while (true)
         {
+            Entry? created = null;
             var entry = _cache.AddOrUpdate(fullPath,
-                _ => Create(fullPath, relativePath, stamp, cancellationToken),
-                (_, existing) => existing.Stamp == stamp ? existing : Create(fullPath, relativePath, stamp, cancellationToken));
+                _ => created = Create(fullPath, relativePath, stamp, cancellationToken),
+                (_, existing) => existing.Stamp == stamp ? existing : created = Create(fullPath, relativePath, stamp, cancellationToken));
             try
             {
-                return entry.Export.Value;
+                var export = entry.Export.Value;
+                // Someone else's export (an earlier call, or the background monitor): from this caller's view it was reused
+                if (!ReferenceEquals(entry, created))
+                    return export with { Reused = true };
+                if (!export.Reused)
+                    RaiseExportsChanged(relativePath);
+                return export;
             }
             catch (OperationCanceledException)
             {
@@ -79,6 +95,72 @@ public sealed class ProjectExportCache(ExportOptions options, DecompilerService 
                 throw;
             }
         }
+    }
+
+    /// <summary>
+    /// Deletes the assembly's exported project (and any leftover temp folders) and forgets it in memory.
+    /// Used when the assembly has disappeared from the scan directory. Returns true if a folder was deleted.
+    /// </summary>
+    public bool RemoveExport(string fullPath, string relativePath, CancellationToken cancellationToken = default)
+    {
+        _cache.TryRemove(fullPath, out _);
+
+        var projectDir = ProjectDirectoryFor(relativePath);
+        var parent = Path.GetDirectoryName(projectDir)!;
+        if (!Directory.Exists(parent))
+            return false;
+
+        using (AcquireLock(projectDir + ".lock", cancellationToken))
+        {
+            foreach (var stale in Directory.EnumerateDirectories(parent, Path.GetFileName(projectDir) + ".tmp-*"))
+                DeleteOwnedDirectory(stale);
+            if (!Directory.Exists(projectDir))
+                return false;
+            DeleteOwnedDirectory(projectDir);
+        }
+        logger.LogInformation("Removed export of {Assembly}: the assembly no longer exists", relativePath);
+        RaiseExportsChanged(relativePath);
+        return true;
+    }
+
+    /// <summary>
+    /// Output-relative paths (same form as scan-relative paths, e.g. "sub/Foo.dll") of every exported project on disk,
+    /// identified by a folder named *.dll that holds a manifest. Project folders are not descended into.
+    /// </summary>
+    public IReadOnlyList<string> FindExportedAssemblies()
+    {
+        var results = new List<string>();
+        if (!Directory.Exists(options.OutputDirectory))
+            return results;
+
+        var pending = new Stack<string>();
+        pending.Push(options.OutputDirectory);
+        while (pending.Count > 0)
+        {
+            IEnumerable<string> children;
+            try
+            {
+                children = Directory.EnumerateDirectories(pending.Pop()).ToList();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                continue;
+            }
+
+            foreach (var dir in children)
+            {
+                var name = Path.GetFileName(dir);
+                if (name.Contains(".dll.tmp-", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (name == LanguageServerFolderName && Path.GetDirectoryName(dir) == options.OutputDirectory)
+                    continue;
+                if (name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) && File.Exists(Path.Combine(dir, ManifestFileName)))
+                    results.Add(Path.GetRelativePath(options.OutputDirectory, dir));
+                else
+                    pending.Push(dir);
+            }
+        }
+        return results;
     }
 
     private Entry Create(string fullPath, string relativePath, Stamp stamp, CancellationToken cancellationToken) =>
@@ -168,29 +250,21 @@ public sealed class ProjectExportCache(ExportOptions options, DecompilerService 
 
     /// <summary>
     /// Cross-process mutual exclusion per project. Two MCP clients registered on the same scan directory share the
-    /// default output directory, so this is the normal case. FileShare.None maps to an advisory lock on Unix.
+    /// default output directory, so this is the normal case.
     /// </summary>
-    private static FileStream AcquireLock(string lockPath, CancellationToken cancellationToken)
+    private static FileStream AcquireLock(string lockPath, CancellationToken cancellationToken) =>
+        FileLock.Acquire(lockPath, LockTimeout, cancellationToken);
+
+    private void RaiseExportsChanged(string relativePath)
     {
-        var started = DateTime.UtcNow;
-        while (true)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            try
-            {
-                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, bufferSize: 1);
-            }
-            catch (IOException ex)
-            {
-                // Only a lock held by another process is worth waiting for; if the file could not even be created
-                // (path too long, folder gone, disk full) the error is real and must surface
-                if (!File.Exists(lockPath))
-                    throw;
-                if (DateTime.UtcNow - started > LockTimeout)
-                    throw new IOException($"Timed out after {LockTimeout.TotalMinutes:N0} minutes waiting for '{lockPath}'; " +
-                                          $"another process seems stuck exporting this assembly. ({ex.Message})", ex);
-                cancellationToken.WaitHandle.WaitOne(250);
-            }
+            ExportsChanged?.Invoke(relativePath);
+        }
+        catch (Exception ex)
+        {
+            // A subscriber's failure must never fail an export
+            logger.LogWarning(ex, "An ExportsChanged handler failed for {Assembly}", relativePath);
         }
     }
 

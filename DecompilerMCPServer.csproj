@@ -25,6 +25,21 @@
     <PackageReference Include="ICSharpCode.Decompiler" Version="11.0.0.9375" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.11" />
     <PackageReference Include="ModelContextProtocol" Version="2.2.0" />
+    <PackageReference Include="NuGet.Frameworks" Version="7.9.0" />
+    <PackageReference Include="StreamJsonRpc" Version="2.26.150" />
+  </ItemGroup>
+
+  <!-- The test project lives below this folder; keep its sources out of the server's default globs -->
+  <PropertyGroup>
+    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DecompilerMCPServer.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include=".ai\" />
   </ItemGroup>
 
 </Project>
