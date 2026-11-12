@@ -6,8 +6,50 @@ Optionally (`--EnableLanguageServer true`), it also runs a [Roslyn language serv
 
 Built on [ICSharpCode.Decompiler](https://github.com/icsharpcode/ILSpy) (the ILSpy engine) and the official [MCP C# SDK](https://github.com/modelcontextprotocol/csharp-sdk), communicating over stdio.
 
-## Install
+## Quick start
 
+**1. Install** the self-contained binary (no .NET runtime needed):
+
+```bash
+# macOS -> ~/.local/bin/DecompilerMCPServer
+curl -fsSL https://raw.githubusercontent.com/jcarley/DecompilerMCPServer/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows -> %LOCALAPPDATA%\Programs\DecompilerMCPServer\DecompilerMCPServer.exe
+irm https://raw.githubusercontent.com/jcarley/DecompilerMCPServer/main/scripts/install.ps1 | iex
+```
+
+The script prints the exact registration command for your machine. These one-liners require the repository to be public. While it is private, follow [Manual download](#manual-download) or [Building from source](#building-from-source).
+
+**2. Choose a DLL folder.** The only required setting is `--ScanDirectory`, the folder the server scans recursively for `*.dll` files. The decompiled sources are written to a per-user folder by default ([Configuration](#configuration)).
+
+**3. Register the server with your client.** Use absolute paths. Replace `/Users/you/...` with your own path; on Windows, use the `.exe` path.
+
+- **Claude Code**: run `claude mcp add decompiler -- /Users/you/.local/bin/DecompilerMCPServer --ScanDirectory /path/to/dlls`, then run `/mcp` to confirm the connection.
+- **GitHub Copilot (VS Code)**: add `.vscode/mcp.json`, then enable the `decompiler` tools in Copilot Chat **Agent** mode:
+
+  ```json
+  {
+    "servers": {
+      "decompiler": {
+        "type": "stdio",
+        "command": "/Users/you/.local/bin/DecompilerMCPServer",
+        "args": ["--ScanDirectory", "/path/to/dlls"]
+      }
+    }
+  }
+  ```
+
+- **Claude Desktop**: use the same JSON with an `mcpServers` top-level key instead of `servers`, and without the `type` field.
+
+For Visual Studio, Rider, project-scoped setups and Windows path escaping, see [Registering with an MCP client](#registering-with-an-mcp-client).
+
+**4. Try it.** Ask, for example, *"List the decompiled assemblies"* or *"Find where `MyNamespace.Widget` is defined and explain it"*. See [Tools](#tools) for the full list.
+
+> Optional: `--EnableLanguageServer true` adds semantic navigation (go to definition, find references, …). It requires a .NET 10 SDK; see [Language server](#language-server-optional). Never register the server as `dotnet run`: MSBuild output on stdout breaks the protocol.
+
+## Install
 Prebuilt self-contained binaries (no .NET runtime required) are published to [GitHub Releases](https://github.com/jcarley/DecompilerMCPServer/releases) for macOS (Apple Silicon and Intel) and Windows (x64 and arm64).
 
 > The one-liners below require the repository to be public. While it is private, use `gh release download` and follow the manual steps instead.
@@ -28,7 +70,7 @@ irm https://raw.githubusercontent.com/jcarley/DecompilerMCPServer/main/scripts/i
 $env:DECOMPILER_MCP_VERSION = 'v0.1.0'; irm https://raw.githubusercontent.com/jcarley/DecompilerMCPServer/main/scripts/install.ps1 | iex
 ```
 
-Both scripts download the release archive, verify its SHA256 checksum against the release's `SHA256SUMS` file, install the binary, run a quick launch check, and print the exact registration command for your machine.
+Both scripts download the release archive, verify its SHA256 checksum against the release's `SHA256SUMS` file, install the binary, run a quick launch check, and print the exact registration command for your machine. Set `DECOMPILER_MCP_INSTALL_DIR` to install somewhere else.
 
 ### Manual download
 
@@ -63,7 +105,7 @@ DecompilerMCPServer --ScanDirectory /path/to/dlls
 ScanDirectory=/path/to/dlls DecompilerMCPServer
 ```
 
-If the setting is missing or the directory doesn't exist, the server prints an error to stderr and exits with code 1 instead of starting.
+If the setting is missing or the directory doesn't exist, the server prints an error to stderr and exits with code 1 instead of starting. It does the same for any invalid optional setting below, such as a non-boolean `WatchScanDirectory`.
 
 One setting is optional: **`OutputDirectory`** — where decompiled projects are written. Same two forms (`--OutputDirectory /path` or the `OutputDirectory` environment variable). When omitted it defaults to a per-user folder derived from the scan directory:
 
@@ -102,14 +144,14 @@ Prerequisites: a **.NET 10 SDK** on the machine (the release binaries are self-c
 
 The server reuses what is already installed before downloading anything:
 
-1. **dotnet**: `--DotnetPath`, then `DOTNET_ROOT`, then `PATH`, then the default install locations. It needs a .NET 10+ runtime and SDK.
+1. **dotnet**: `--DotnetPath` (used alone, no fallback), else `DOTNET_ROOT_<ARCH>` (e.g. `DOTNET_ROOT_ARM64`), `DOTNET_ROOT`, `PATH`, the default install locations, then `~/.dotnet`. It needs a .NET 10+ runtime. An install that also has a .NET 10+ SDK is preferred; with a runtime only, the server logs a warning and results may be incomplete.
 2. **Roslyn language server**, first compatible match:
    1. `--LanguageServerPath`
    2. a copy this server downloaded earlier (`%LOCALAPPDATA%\DecompilerMCPServer\roslyn-ls\` on Windows, `~/Library/Application Support/DecompilerMCPServer/roslyn-ls/` on macOS)
-   3. the copy bundled with the C# extension of VS Code, VS Code Insiders, VS Code Server, Cursor or Windsurf
+   3. the copy bundled with the C# extension of VS Code, VS Code Insiders, VS Code Server, VSCodium, Cursor or Windsurf (including their remote-server folders), newest first
    4. a `roslyn-language-server` dotnet tool
 
-   A candidate counts as compatible when its runtime requirements are met by the dotnet found in step 1, and it really starts. If a candidate fails to start, the next one is tried.
+   A candidate counts as compatible when it is version 5.0 or later, its runtime requirements are met by the dotnet found in step 1, and it really starts. If a candidate fails to start, the next one is tried.
 3. **Download**: if nothing usable is found, the pinned `roslyn-language-server.<platform>` package (version 5.11.0, about 70 MB) is downloaded once from nuget.org. It is checked against a SHA256 built into the server and cached in the folder above. The language server is MIT-licensed and isn't redistributed with this server.
 
 stderr logs which server was chosen (`Using Roslyn language server ... from ...`).
@@ -118,7 +160,7 @@ stderr logs which server was chosen (`Using Roslyn language server ... from ...`
 |---|---|---|
 | `EnableLanguageServer` | `false` | Register the language-server tools |
 | `LanguageServerPath` | discovered | Path to `Microsoft.CodeAnalysis.LanguageServer.dll`; skips discovery and download |
-| `LanguageServerVersion` | `5.11.0` | Use exactly this `roslyn-language-server` version (from the cache, downloading it if needed; versions other than the pinned one are not checksum-verified) and skip editor installs |
+| `LanguageServerVersion` | none | Use exactly this `roslyn-language-server` version (from the cache, downloading it if needed) and skip editor installs and dotnet tools. When unset, discovery runs and a download falls back to the pinned 5.11.0. Versions other than 5.11.0 are not checksum-verified |
 | `DotnetPath` | discovered | The `dotnet` executable to run the language server with |
 | `LanguageServerLoadTimeoutSeconds` | `300` | How long a call waits for the workspace to load before answering with what is loaded |
 
@@ -332,7 +374,7 @@ The symbol's full signature, including constraints, and its XML documentation wh
 
 ## Behavior notes
 
-- **Exports persist**: each project folder carries a `.decompiled.json` manifest recording the DLL's size, timestamp, module version id (MVID) and the ILSpy engine version. While all four match, every tool reuses the export — across server restarts too. Rebuilding a DLL (or upgrading the server's decompiler) triggers a fresh export into a temp folder that is swapped into place, so a crash never leaves a half-written project. A large folder takes a while to export the first time (a ~3 MB assembly takes tens of seconds); with `WatchScanDirectory` on this happens in the background at startup, and a tool that needs a DLL still being exported waits for that export to finish. Subsequent calls are instant.
+- **Exports persist**: each project folder carries a `.decompiled.json` manifest recording the DLL's size, timestamp, module version id (MVID) and the ILSpy engine version (plus an internal layout version). While all of them match, every tool reuses the export — across server restarts too. Rebuilding a DLL (or upgrading the server's decompiler) triggers a fresh export into a temp folder that is swapped into place, so a crash never leaves a half-written project. A large folder takes a while to export the first time (a ~3 MB assembly takes tens of seconds); with `WatchScanDirectory` on this happens in the background at startup, and a tool that needs a DLL still being exported waits for that export to finish. Subsequent calls are instant.
 - **Background sync** (`WatchScanDirectory`, on by default): exports run one at a time on a background thread so the server stays responsive. A DLL that is still locked or being written is retried with backoff; a missed or overflowing file-watcher event triggers a full rescan. Progress and failures are logged to stderr.
 - **Shared output**: several server processes (say, Claude Code and Claude Desktop registered on the same folder) can share an output directory; a lock file beside each project folder makes them take turns, so a DLL is exported once.
 - **Resilience**: a corrupt or unreadable DLL is skipped with a note in search results, listed under "Failed assemblies" by `decompile_all`, and reported as an error text elsewhere; bad input (invalid regex, unknown type) returns a descriptive `Error: ...` message. The server itself keeps running.
@@ -348,6 +390,7 @@ The symbol's full signature, including constraints, and its XML documentation wh
 | `DecompilerService.cs` | ILSpy wrapper: whole-project export, type-to-file mapping, metadata probes |
 | `AssemblyDiscoveryService.cs` | Recursive scan and identifier resolution |
 | `ProjectExportCache.cs` | Manifest-backed export cache: freshness check, cross-process lock, temp-and-swap writes |
+| `FileLock.cs` | Cross-process lock-file helper shared by the export cache and the language server installer |
 | `ScanDirectoryMonitor.cs` | Background startup export and file watching that keeps exports in sync with the scan directory |
 | `LanguageServerTools.cs` | The six optional language-server tools |
 | `LanguageServer/` | Roslyn language server hosting: dotnet/server discovery, download fallback, workspace generation, LSP client, symbol resolution |
